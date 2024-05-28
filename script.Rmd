@@ -1,0 +1,107 @@
+---
+title: "火燒分析"
+output: html_notebook
+---
+
+# 概述
+針對國家公園的火燒分析，利用dNBR來檢視火燒，建立function，來檢視火燒的恢復時間與情況。
+# 0. package
+```{r}
+library(raster) # for raster calculate
+library(sf) # for vector
+library(data.table)
+library(tidyverse)
+library(stringr) # for text
+setwd("G:/我的雲端硬碟/協助分析/又綾/國家公園火燒分析/")
+```
+# 1. function
+建構可以輸入時間、地點圖層，計算dNBR的function
+year: 起始年
+location:火燒範圍圖層(shp)
+
+```{r}
+
+dNBR_caculat <- function(year,location){
+    i <- which(names(nbr_raw) == year)
+    x <-  nbr_raw[[i]] #火燒前的年份，作為起始nbr值
+    result <- lapply((i+1):length(nbr_raw),function(rast_num){
+      dnbr <- x-nbr_raw[[rast_num]] ## 計算全圖的dnbr
+      dnbr_fire_reg <- mask(x = dnbr,mask=location)
+      return(dnbr_fire_reg)
+    })
+  return(result)}
+```
+## 1.1 範例操作與繪圖
+假設我們要來計算1984年的資料，1984年的資料較特殊，必須另外處理。由於1984年的資料缺漏，dNBR是從1986年開始。
+```{r}
+nbr_path <- list.files("rawdata/nbr/",
+                        pattern = "nbr_mean_.*tif$",
+                        full.names = TRUE) #建構nbr的圖層路徑
+nbr_raw <- lapply(nbr_path,raster) # 讀入所有nbr圖層
+names(nbr_raw)<- str_extract(nbr_path,"\\d{4}")
+loc <- st_read("rawdata/fire_area_polygon/19841202_fire_boundary_3826.shp")
+year <- "1984" # 必須轉成字串而非數值
+loc <- st_transform(loc,crs = 4326) # 將匯入的圖層轉成4326
+loc_box <- loc %>% # 以方形的方式來擷取數據
+  st_buffer(.,dist=20) %>%  # 進行圖層buffer
+  st_bbox() %>% # 取最大最小值
+  st_as_sfc() %>% # 轉成sfc
+  st_sf(geometry =.) #轉成圖層資料
+fire_1984 <- dNBR_caculat("1984",loc_box)## 切記，年份必須是文字資料
+
+######## 繪製結果
+fire_yaer <- 1984 ## 火燒年份 
+fire_code <- "19841202"
+st_year <- 1986 ## 在這邊修改需要呈現的年份
+################################################################
+dir.create(paste0("restult/dNBR/plot/",fire_code)) 創建儲存資料路徑
+dnbrr_plot <- lapply(1:length(fire_1984),function(i){
+  dnbr_dt <- as.data.frame(fire_1984[[i]],xy = TRUE, na.rm = TRUE)
+  p <- ggplot() +
+      geom_raster(
+        data = dnbr_dt,
+        aes(x = x, y = y, fill = layer,color="")) +
+      scale_fill_gradient2(midpoint = 0, 
+                             high = "#00700F",mid="#FFF7B8",low="#7A1000",
+                             limits=c(-0.8,0.8)) +
+      labs(title = "dNBRr of TATAKA Fire Site",
+        subtitle = paste(fire_yaer,"to",st_year-1+i),
+        x = "Longitude",
+        y = "Latitude")+
+      geom_sf(data=loc,fill=NA)+
+      theme_minimal()
+    
+    ggsave(plot=p,
+         paste0("result/dNBR/",fire_code,"/dNBR_",fire_yaer,"_",st_year+i-1,".jpeg"),
+         width=10,height = 6,dpi=600)
+    return(p)
+  })
+```
+
+## 1.2 計算區域內的dNBR與繪圖
+
+```{r}
+fire_reg <- loc[!st_is_empty(loc),] ## 對火燒的polygon再作處理
+dnbr_clip <- lapply(fire_1984,mask,mask=fire_reg) ## 將dnbr的結果再次限縮到火燒區域
+## 以下計算各年度的dNBR數值 並繪圖
+dnbr_stat <- lapply(1:length(dnbr_clip),function(i){ 
+   mean <- cellStats(dnbr_clip[[i]],stat="mean")
+   qua <- quantile(dnbr_clip[[i]], probs = c(0.25, 0.75))
+   dt <- data.table(fire_cd=fire_code,year=st_year+i-1,mean=mean,q_25=qua[1],q_75=qua[2])
+   return(dt)})
+dnbr_stat <- rbindlist(dnbr_stat)
+
+write.csv(dnbr_stat,paste0("result/dNBR/stat_table/",fire_code,".csv")) ##將統計資料存成csv
+
+ggplot(dnbr_stat,aes(x=year))+
+  geom_line(aes(y=mean),color="blue4")+
+  geom_ribbon(aes(ymax=q_25,ymin=q_75),fill="gray",alpha=0.5)+
+  geom_hline(yintercept = 0,lty="dashed",color="darkred")+
+  theme_bw()+
+  scale_x_continuous(breaks = seq(st_year,2023,2))+
+  labs(y="mean of dNBR")
+ggsave(paste0("result/dNBR/plot/dnbr_stat_",fire_code,".jpeg"),width=10,height=5,dpi=300)
+
+
+```
+
