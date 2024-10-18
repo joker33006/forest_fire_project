@@ -1,0 +1,121 @@
+---
+title: "fire risk grid"
+output: html_notebook
+---
+# 概述
+處理火燒資料，將火燒範圍網格化，利用相同網格萃取相關火燒風險因子，最後投入random forest regression建模，以了解各項因子對火燒風險之影響。
+# 0. package
+```{r}
+library(data.table)
+library(tidyverse)
+library(sf)
+library(parallel)
+library(raster)
+library(exactextractr) 
+library(SPEI)
+p_path <- "G:/我的雲端硬碟/協助分析/又綾/國家公園火燒風險評估/"
+```
+
+# 1. creating grid
+```{r}
+fire_rg <- st_read(paste0(p_path,"rawdata/layer/fire_merge4.shp"))
+fire_rg <- fire_rg[,c("fid","firecode")]
+### 製作基礎網格
+st_bbox(fire_rg)
+bs_grid <- st_bbox(c(xmin = 228700, ymin = 2569300,
+                     xmax = 300900, ymax = 2713000), 
+                   crs = st_crs(3826)) %>%
+  st_as_sfc() %>%
+  st_make_grid(., cellsize = c(100, 100), what = "polygons")
+bs_grid_sf <-st_sf(geometry = bs_grid) 
+rm(bs_grid)
+### 擷取火燒範圍
+fire_grid <- st_join(bs_grid_sf,fire_rg)
+fire_grid <- fire_grid[!is.na(fire_grid$fid),]
+
+```
+# 2. 處理veg ind
+以火燒時間擷取NDVI, NBR以及NDMI數值。
+NDVI與NDMI取前一年資料，作為火燒前背景。
+NBR火燒前一年與火燒後一年差值，作為火燒嚴重數值。
+```{r}
+## 設立資料路徑
+veg_rast_path <-paste0(p_path,"rawdata/layer/vegetation_index/")
+
+## 篩選火燒網格id年分，並取出相關圖層
+fire_grid$year <- substr(fire_grid$firecode,1,4)
+fire_grid <- fire_grid[fire_grid$year>1986,]
+
+fire_g2 <- lapply(unique(fire_grid$year),function(year){
+  test <- fire_grid[fire_grid$year==year,]
+  test_rast_pre <- stack(paste0(veg_rast_path,"nbr_mean_",as.numeric(year)-1,
+                                ".tif"))
+  test_rast_aft <- stack(paste0(veg_rast_path,"nbr_mean_",as.numeric(year)+1,
+                                ".tif"))
+  test$nbr_pre <- exact_extract(test_rast_pre[[1]],test, fun = "mean")
+  test$ndvi <- exact_extract(test_rast_pre[[2]],test, fun = "mean")
+  test$ndmi <- exact_extract(test_rast_pre[[3]],test, fun = "mean")
+  test$nbr_aft <- exact_extract(test_rast_aft[[1]],test, fun = "mean")
+  test$dnbr <- (test$nbr_pre-test$nbr_aft)*1000
+  fire_g2 <- rbind(fire_g2,test)
+})
+fire_g2 <- do.call("rbind", fire_g2)
+fire_g2$id <- paste0("n_",1:nrow(fire_g2))
+fire_gp <- st_centroid(fire_g2)
+
+write.csv(fire_gp,paste0(p_path,"result/grid_point.csv"))
+```
+
+# 3. ERA5_data deal
+利用逐年的ERA5圖層，計算spei指標
+該圖層一年一張，內有兩個波段，分別為降雨與潛在蒸散量。
+```{r}
+## test
+ts_layer <- stack(paste0(p_path,"rawdata/layer/ERA5/ERA5_1951-0000000000-0000000000.tif"))
+
+ts_dt <- raster::extract(ts_layer[[1]],fire_gp) %>% as.data.table()
+
+ts_dt <- data.table(fire_gp[,c("id")],ts_dt)
+colnames(ts_dt)[3] <- "var"
+ts_dt[,grp:=.GRP,by=var]
+bs_dt <- ts_dt[!duplicated(grp)]
+
+write.csv(bs_dt,paste0(p_path,"/result/spei_point.csv"))
+rm(ts_layer,test)
+### 處理雲端下來的資test### 處理雲端下來的資料
+spei <- fread(paste0(p_path,"rawdata/NP_fire_monthly_1950_2023_12_31.csv"))
+spei[,grp:=bs_dt$grp]
+spei[,`system:index`:=NULL][,.geo:=NULL][,id:=NULL]
+spei[,1775:ncol(spei)]
+spei_t <- melt(spei, id.vars=c("grp"),variable.name = "var",value.name="value")
+spei_t[,year:=str_sub(var, start = 1, end = 4)][
+  ,month:=str_sub(var,5,6)][
+    ,var_name:=str_sub(var,8,str_count(var))
+  ]
+spei <- dcast(spei_t,year+month+grp~var_name,value.var = "value")
+
+setnames(spei,c("potential_evaporation_sum",
+              "total_precipitation_sum"),
+         c("PE","precip"))
+spei <- spei[!is.na(PE)][,V1:=NULL]
+
+spei[,c("PE","precip"):=.(PE*1000,precip*1000)][
+  ,D:=precip+PE]
+for (i in unique(spei$grp)){
+  spei[grp==i,spei_3:=as.data.table(spei(D,3)$fitted)][
+        grp==i,spei_6:=as.data.table(spei(D,6)$fitted)][
+         grp==i,spei_12:=as.data.table(spei(D,12)$fitted)][
+           grp==i,spei_24:=as.data.table(spei(D,24)$fitted)]
+}
+### 合併資料
+ts_dt <- as.data.table(ts_dt)
+ts_dt[,geometry:=NULL][,var:=NULL]
+fire_gdt <- as.data.table(fire_g2)
+fire_gdt <- fire_gdt[ts_dt,on=.(id)]
+fire_gdt[,month:=str_sub(firecode,5,6)]
+colnames(spei)
+fire_gdt <- spei[,.(year,month,grp,spei_3,spei_6,spei_12,spei_24)][
+  fire_gdt,on=.(year,month,grp)]
+
+```
+
