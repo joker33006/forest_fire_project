@@ -13,6 +13,8 @@ library(parallel)
 library(raster)
 library(exactextractr) 
 library(SPEI)
+library(randomForest)
+
 p_path <- "G:/我的雲端硬碟/協助分析/又綾/國家公園火燒風險評估/"
 ```
 
@@ -57,8 +59,10 @@ fire_g2 <- lapply(unique(fire_grid$year),function(year){
   test$ndmi <- exact_extract(test_rast_pre[[3]],test, fun = "mean")
   test$nbr_aft <- exact_extract(test_rast_aft[[1]],test, fun = "mean")
   test$dnbr <- (test$nbr_pre-test$nbr_aft)*1000
-  fire_g2 <- rbind(fire_g2,test)
+  return(test)
 })
+plot(fire_g2)
+st_write(fire_g2, paste0(p_path,"result/dnbr_grid.shp"))
 fire_g2 <- do.call("rbind", fire_g2)
 fire_g2$id <- paste0("n_",1:nrow(fire_g2))
 fire_gp <- st_centroid(fire_g2)
@@ -71,10 +75,9 @@ write.csv(fire_gp,paste0(p_path,"result/grid_point.csv"))
 該圖層一年一張，內有兩個波段，分別為降雨與潛在蒸散量。
 ```{r}
 ## test
-ts_layer <- stack(paste0(p_path,"rawdata/layer/ERA5/ERA5_1951-0000000000-0000000000.tif"))
+ts_layer <- raster(paste0(p_path,"rawdata/layer/ERA5/ERA5_1951-0000000000-0000000000.tif"))
 
-ts_dt <- raster::extract(ts_layer[[1]],fire_gp) %>% as.data.table()
-
+ts_dt <- raster::extract(ts_layer,fire_gp) %>% as.data.table()
 ts_dt <- data.table(fire_gp[,c("id")],ts_dt)
 colnames(ts_dt)[3] <- "var"
 ts_dt[,grp:=.GRP,by=var]
@@ -86,7 +89,7 @@ rm(ts_layer,test)
 spei <- fread(paste0(p_path,"rawdata/NP_fire_monthly_1950_2023_12_31.csv"))
 spei[,grp:=bs_dt$grp]
 spei[,`system:index`:=NULL][,.geo:=NULL][,id:=NULL]
-spei[,1775:ncol(spei)]
+
 spei_t <- melt(spei, id.vars=c("grp"),variable.name = "var",value.name="value")
 spei_t[,year:=str_sub(var, start = 1, end = 4)][
   ,month:=str_sub(var,5,6)][
@@ -116,6 +119,107 @@ fire_gdt[,month:=str_sub(firecode,5,6)]
 colnames(spei)
 fire_gdt <- spei[,.(year,month,grp,spei_3,spei_6,spei_12,spei_24)][
   fire_gdt,on=.(year,month,grp)]
+rm(spei_t,spei)
+```
+# 4. single raster factor
+處理坡度、坡向、TWI指數
+```{r}
+
+s_rf_path <- list.files(paste0(p_path,"/rawdata/layer/raster_factor/"),
+                        full.names = TRUE)
+
+rf_layer <- lapply(s_rf_path,raster)
+fire_gdt$asp_recl <- exact_extract(rf_layer[[1]],fire_grid, fun = "mean")
+fire_gdt$slope <- exact_extract(rf_layer[[2]],fire_grid, fun = "mean")
+fire_gdt$twi <- exact_extract(rf_layer[[3]],fire_grid, fun = "mean")
+rm(rf_layer)
+```
+# 5. human impact factor
+處理山屋、山徑以及道路三項因子
+```{r}
+### 山屋
+hf_str <- st_read(paste0(p_path,"rawdata/layer/vector_factor/山屋_FINAL2.shp"))
+hf_str_j <-st_intersection(fire_g2[,c("id")],hf_str,left = TRUE) 
+hf_str_j <- hf_str_j[!is.na(hf_str_j$fid),]
+hf_str_j$area <-st_area(hf_str_j) 
+hf_str_j <- as.data.table(hf_str_j)
+hf_str_j[,area:=as.numeric(area)]
+hf_str_l <- hf_str_j[,.(h_str_level=sum(level*area)/10000),by=.(id)]
+
+fire_gdt <- hf_str_l[fire_gdt,on=.(id)]
+fire_gdt[is.na(h_str_level),h_str_level:=0]
+#### 修正風險等級，應該是距離山屋越近，風險等級越高(1~4改成4~1)
+fire_gdt[h_str_level>0,h_str_level:=5-h_str_level]
+rm(hf_str,hf_str_j)
+### 路徑
+hf_hiking_r <- st_read(paste0(p_path,"rawdata/layer/vector_factor/路徑_final2.shp"))
+hf_hr_j <-st_intersection(fire_g2[,c("id")],hf_hiking_r,left=TRUE) 
+hf_hr_j <- hf_hr_j[!is.na(hf_hr_j$fid),]
+hf_hr_j$area <- st_area(hf_hr_j) 
+hf_hr_j <- as.data.table(hf_hr_j)
+hf_hr_l <- hf_hr_j[,.(hf_hr_level=sum(level*area/sum(area))),by=.(id)]
+hf_hr_l[,hf_hr_level:=as.numeric(hf_hr_level)]
+fire_gdt <- hf_hr_l[fire_gdt,on=.(id)]
+fire_gdt[is.na(hf_hr_level),hf_hr_level:=0]
+#### 修正風險等級，應該是距離路越近，風險等級越高(1~4改成4~1)
+fire_gdt[hf_hr_level>0,hf_hr_level:=5-hf_hr_level]
+rm(hf_hr_j,hf_hiking_r)
+### 省道
+hf_road_r <- st_read(paste0(p_path,"rawdata/layer/vector_factor/省道_final.gpkg"))
+hf_ro_j <-st_intersection(fire_g2[,c("id")],hf_road_r,left=TRUE) 
+
+hf_ro_j$area <- st_area(hf_ro_j) 
+hf_ro_j <- as.data.table(hf_ro_j)
+hf_ro_l <- hf_ro_j[,.(hf_ro_level=sum(level*area/sum(area))),by=.(id)]
+hf_ro_l[,hf_ro_level:=as.numeric(hf_ro_level)]
+fire_gdt <- hf_ro_l[fire_gdt,on=.(id)]
+fire_gdt[is.na(hf_ro_level),hf_ro_level:=0]
+rm(hf_ro_j,hf_road_r)
+write.csv(fire_gdt,paste0(p_path,"result/fire_grid_and_all_factor.csv"))
+```
+# ramdon forest
+
+```{r}
+colnames(fire_gdt)
+fire_gdt[is.na(twi)]
+fire_gdt[,p_wi:=ndmi/ndvi]
+fire_gdt_fire <- fire_gdt2[dnbr>0]
+rf_mod_r <- randomForest(dnbr~hf_hr_level+hf_ro_level+h_str_level+spei_3+
+                           spei_6+spei_12+spei_24+p_wi+asp_recl+
+                           slope+twi+ndvi+ndmi,
+                         data=fire_gdt,
+                         mtry=4,
+                         type= "regression",
+                         na.action = na.omit,
+                         ntree=200)
+rf_mod_r
+importance(rf_mod_r)
+plot(rf_mod_r)
+importance (rf_mod_r,type=1)
+varImpPlot(rf_mod_r,type=1)
+partialPlot(rf_mod_r,fire_gdt[!is.na(twi)],x.var = "twi")
+
+## part II 將火燒變成有無
+class(fire_gdt)
+fire_gdt[,fir_fq:=NULL]
+fire_gdt[dnbr<50,fir_fq:=0][dnbr>=50,fir_fq:=1]
+fire_gdt[,fir_fq:=factor(fir_fq)][,spei_ins:=spei_3*spei_12]
+rf_mod_r2 <- randomForest(fir_fq~hf_hr_level+hf_ro_level+h_str_level+spei_3+
+                          spei_6+spei_12+spei_24+ndvi+asp_recl+
+                          slope+twi+p_wi,
+                          data=fire_gdt,
+                          mtry=4,
+                          ntree=1000,
+                          type="classification",
+                          na.action = na.omit)
+
+
+rf_mod_r2
+importance(rf_mod_r2)
+plot(rf_mod_r2)
+varImpPlot(rf_mod_r2)
+partialPlot(rf_mod_r2,fire_gdt[!is.na(p_wi)],x.var = "p_wi")
 
 ```
+
 
