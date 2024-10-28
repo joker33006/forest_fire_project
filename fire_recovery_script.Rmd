@@ -1,0 +1,94 @@
+---
+title: "forest fire recover"
+output: html_notebook
+---
+# 概述
+將火燒範圍網格化後，再次分析森林火燒的恢復情形。
+# 0. package
+```{r}
+library(data.table)
+library(sf)
+library(raster)
+library(tidyverse)
+p_path <- "G:/我的雲端硬碟/進行中的研究案/Plant recovery after forest fire/"
+```
+# 1. nbr data fliter
+```{r}
+r_grid <- st_read(paste0(p_path,"rawdata/layer/dnbr_grid.shp"))
+colnames(r_grid)
+r_grid <- r_grid[,c("firecode","year","ndvi","id")]
+veg_rast_path <- paste0(p_path,"rawdata/layer/vegetation_index/")
+nbr_all <- lapply(1986:2023,function(year){
+   test_nbr<- raster(paste0(veg_rast_path,"nbr_mean_",year,
+                                ".tif"),band=1)
+  test <-data.table(nbr=exact_extract(test_nbr,r_grid, fun = "mean"))
+  setnames(test,"nbr",paste0("nbr",year))
+  return(test)
+})
+nbr_tb <- do.call(cbind,nbr_all)
+r_g_nbr <- cbind(r_grid,nbr_tb)
+rm(r_grid,nbr_tb)
+class(r_g_nbr)
+r_dt_nbr <- as.data.table(r_g_nbr)
+### 清除每次火燒前的資料
+for(y in unique(r_g_nbr$year)){
+  rm_col_end <- grep(as.numeric(y),colnames(r_g_nbr))-2
+  rm_col_name <- colnames(r_g_nbr)[5:rm_col_end]
+  r_dt_nbr[year==y,c(rm_col_name):=NA]
+}
+rm(rm_col_end,rm_col_name)
+
+```
+# 2. calculate the dnbr
+1. 先將表格轉置
+2. 批次計算各次火燒的dnbr
+3. 篩選出dnbr>100的火燒網格(以火燒後3年內達到為計算)
+```{r}
+colnames(r_dt_nbr)
+rdt_t <- melt(r_dt_nbr,id.vers=c("firecode","year","ndvi","id","geometry"),
+              measure.vars =patterns("nbr\\d{4}"),
+              variable.name = "nbr_year",value.name = "nbr")
+### 移除空值
+rdt_t <- rdt_t[!is.na(nbr)&!is.na(id)]
+### 計算各網格的dnbr`,並給予排序id
+colnames(rdt_t)
+rdt_nbr <- lapply(unique(rdt_t$id),function(g_id){
+  dt <- rdt_t[id==g_id]
+  bg_year <-as.numeric(dt[1,year])-1
+  bg_nbr <- dt[grep(bg_year,nbr_year),nbr]
+  dt[,dnbr:=(bg_nbr-nbr)*1000]
+  dt[,year_ord:=1:.N]
+  return(dt)
+})
+rdt_nbr <- rbindlist(rdt_nbr)
+### 標記反覆火燒的網格，由於篩選火燒嚴重程度大於多少的網格，
+####可能會把反覆火燒的網格刪掉，因此先行標記
+####概念是將網格標示id，並檢視重複的id
+rdt_nbr[, geometry_text:=paste0(geometry)]
+rdt_nbr[,grid_id:=.GRP,by=.(geometry_text)]
+rdt_nbr[,geometry_text:=NULL]
+dup_grid <- unique(rdt_nbr[,.(id,year,firecode,grid_id)])
+dup_grid <- dup_grid[duplicated(grid_id)]
+dup_grid[,re_fire:=1]
+rdt_nbr[,nbr_year:=gsub("nbr","",nbr_year)]
+rdt_nbr <- dup_grid[,.(year,grid_id,re_fire)][rdt_nbr,
+                                              on=.(grid_id,year=nbr_year)]
+setnames(rdt_nbr,c("year","i.year"),c("nbr_year","fire_year"))
+#### 刪除掉前3年未達標準的網格(dnbr<NULL#### 刪除掉前3年未達標準的網格(dnbr<100)，以3年內有達標的網格，篩選出id
+fire_id <- unique(rdt_nbr[dnbr>100&year_ord %in% 2:4,id])
+nbr_f <- rdt_nbr[id %in% fire_id]
+colnames(nbr_f)
+ggplot(nbr_f,aes(x=as.numeric(year_ord),y=dnbr,color=id))+
+  geom_line()+
+  theme(legend.position = "")
+```
+# 3. dnbr basic analysis
+進入dnbr基礎分析，檢視基本趨勢(如deley effect)或恢復時間。看火燒後，火燒傷害還持續多久。
+首先計算將ndvi分類，將其分為草本與森林兩類，檢視原本為森林或草本的
+```{r}
+
+```
+
+
+
+

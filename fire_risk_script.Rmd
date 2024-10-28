@@ -34,7 +34,7 @@ rm(bs_grid)
 ### 擷取火燒範圍
 fire_grid <- st_join(bs_grid_sf,fire_rg)
 fire_grid <- fire_grid[!is.na(fire_grid$fid),]
-
+st_write(fire_grid,paste0(p_path,"rawdata/fire_region_grid.shp"))
 ```
 # 2. 處理veg ind
 以火燒時間擷取NDVI, NBR以及NDMI數值。
