@@ -10,6 +10,18 @@ library(data.table)
 library(sf)
 library(raster)
 library(tidyverse)
+library(ggdist)# stat_halfeye
+library(gghalves) #geom_half_point
+library(exactextractr)
+library(ranger) # for random forest
+library(fastshap) # for shap analysis
+library(future) # speed up
+library(shapviz) # shap plot
+library(patchwork)
+library(parallel)
+library(doParallel) # speed up the shap analysis
+library(performance)
+library(strucchange) # for breakpoint
 p_path <- "G:/我的雲端硬碟/進行中的研究案/Plant recovery after forest fire/"
 ```
 # 1. nbr data fliter
@@ -68,24 +80,445 @@ rdt_nbr[, geometry_text:=paste0(geometry)]
 rdt_nbr[,grid_id:=.GRP,by=.(geometry_text)]
 rdt_nbr[,geometry_text:=NULL]
 dup_grid <- unique(rdt_nbr[,.(id,year,firecode,grid_id)])
-dup_grid <- dup_grid[duplicated(grid_id)]
+dup_grid[,dup:=duplicated(grid_id)]
+dup_grid <- dup_grid[dup==TRUE,.(grid_id,year,firecode)]
 dup_grid[,re_fire:=1]
-rdt_nbr[,nbr_year:=gsub("nbr","",nbr_year)]
-rdt_nbr <- dup_grid[,.(year,grid_id,re_fire)][rdt_nbr,
-                                              on=.(grid_id,year=nbr_year)]
-setnames(rdt_nbr,c("year","i.year"),c("nbr_year","fire_year"))
-#### 刪除掉前3年未達標準的網格(dnbr<NULL#### 刪除掉前3年未達標準的網格(dnbr<100)，以3年內有達標的網格，篩選出id
-fire_id <- unique(rdt_nbr[dnbr>100&year_ord %in% 2:4,id])
-nbr_f <- rdt_nbr[id %in% fire_id]
+setnames(dup_grid,c("year","firecode"),c("re_fy","ref_date"))
+dup_grid[,re_fy:=as.numeric(re_fy)]
+rdt_nbr[,nbr_year:=as.numeric(gsub("nbr","",nbr_year))]
+rdt_nbr[,data_id:=1:nrow(rdt_nbr)]
+rdt_nbr2 <- dup_grid[,.(re_fy,grid_id,re_fire,ref_date)][rdt_nbr,
+                                              on=.(grid_id,re_fy=nbr_year)]
+rdt_nbr3[data_id %in% rdt_nbr2[duplicated(data_id)]$data_id]
+#### 刪除掉重複火燒的格子
+setnames(rdt_nbr2,c("re_fy"),c("nbr_year"))
+rdt_nbr3 <- rdt_nbr2[!((firecode %in% dup_grid$ref_date) 
+                       & (grid_id %in% dup_grid$grid_id))]
+
+#### 刪除掉因同一年內多次火燒而重複的格子
+rdt_nbr3 <- rdt_nbr3[!duplicated(data_id)]
+#### 刪除掉前3年未達標準的網格(dnbr<100)，以3年內有達標的網格，篩選出id
+rdt_nbr3[,year_ord:=year_ord-2] ### 以火燒年為0
+fire_id <- unique(rdt_nbr3[dnbr>100&year_ord %in% 0:3,id])
+
+nbr_f <- rdt_nbr3[id %in% fire_id]
+
+
 colnames(nbr_f)
-ggplot(nbr_f,aes(x=as.numeric(year_ord),y=dnbr,color=id))+
+ggplot(nbr_f,aes(x=year_ord,y=dnbr,color=id))+
   geom_line()+
   theme(legend.position = "")
+rm(r_dt_nbr,r_g_nbr,rdt_nbr,rdt_nbr2,rdt_nbr3,rdt_t,dup_grid)
 ```
 # 3. dnbr basic analysis
 進入dnbr基礎分析，檢視基本趨勢(如deley effect)或恢復時間。看火燒後，火燒傷害還持續多久。
 首先計算將ndvi分類，將其分為草本與森林兩類，檢視原本為森林或草本的
+0.2-0.6 草與灌叢
+0.6以上 森林
+其次計算火燒的延遲效應，亦即d-dNBR，並以持續的增長時間來統計delay effect
+
 ```{r}
+nbr_f[ndvi<0.6,veg_type:="GS"][ndvi>=0.6,veg_type:="F"]
+## delay effect
+nbr_f[,d_dnbr:=dnbr-data.table::shift(dnbr,type="lag")]
+nbr_f[year_ord==-1,d_dnbr:=NA] ## 移除掉每個火燒初始年的數值
+setnames(nbr_f,"year","fire_year")
+nbr_f[,fire_year:=as.numeric(fire_year)]
+###backup_table <- nbr_f
+
+### 以1-5年間的最大值來檢視火燒延遲效應，以達到dNBR最大值的時間點來檢視
+nbr_f[year_ord %in% 0:5,max_dnbr:=max(dnbr,na.rm=T),by=.(id)]
+
+nbr_f[dnbr==max_dnbr,max_years:=year_ord]
+nbr_f[,max_dnbr_5y:=max(max_dnbr,na.rm=T),by=.(id)][
+  ,max_years:=max(max_years,na.rm=T),by=.(id)]
+nbr_f[,max_dnbr:=NULL]
+re_y_stat <- unique(nbr_f[,.(max_years,id,veg_type)])
+
+ggplot(unique(nbr_f[,.(max_years,id,veg_type)]), 
+       aes(x = max_years,
+            fill=veg_type,color=veg_type)) + 
+  geom_bar(position="dodge")+
+  labs(x="recovery year",y="")
+### 檢視恢復時間(dnbr<0)，以dnbr<0最小年限作為恢復期
+nbr_f[dnbr<0&year_ord>1,recover_y:=year_ord,by=.(id)]
+### 計算recovery rate
+nbr_f[,recov_r:=(max_dnbr_5y-dnbr)/max_dnbr_5y*100]
+### 彙整結果，初步結果彙整
+colnames(nbr_f)
+nbr_stat <- nbr_f[,.(max_dnbr_5y=max(max_dnbr_5y),
+                     max_years=min(max_years,na.rm = T),
+                     recover_y=min(recover_y,na.rm = T),
+                     re_fire=sum(re_fire,na.rm=T)),
+                  by=.(firecode,fire_year,ndvi,id,veg_type)]
+nbr_stat[!(id %in% nbr_rc_y$id)]
+nbr_rc_y <- nbr_f[year_ord %in% c(5,10,20,30),.(id,recov_r,year_ord)]
+nbr_stat <- nbr_stat[nbr_rc_y,on=.(id)]
+colnames(nbr_rc_y)
+nbr_rc_y <- dcast(nbr_rc_y,id~year_ord,value.var = "recov_r")
+nbr_f[,wkt := st_as_sf(geometry, crs = 3826)]
+nbr_geo <- st_as_sf(nbr_f[,.(id,wkt)], sf_column_name = "wkt")
+nbr_geo <- as.data.frame(nbr_geo) %>% unique()
+nbr_stg <- nbr_stat[nbr_geo,on=.(id)]
+nbr_stg <- nbr_stg[!is.na(fire_year)]
+nrow(nbr_stg[is_recover==1])/nrow(nbr_stg)*100
+nbr_stg[,.(max_years=mean(max_years)),by=.(veg_type)]
+write.csv(nbr_stg[,.(.N,mx_y_mean=mean(max_years,na.rm=T),mx_y_sd=sd(max_years,na.rm=T)),
+                  by=.(veg_type)],paste0(p_path,"result/stat_max_year_veg_typ.csv"))
+write.csv(nbr_stg[,.(.N,mx_y_mean=mean(max_years,na.rm=T),mx_y_sd=sd(max_years,na.rm=T)),
+                  by=.(veg_type,max_years)],paste0(p_path,"result/stat_max_year_veg_typ.csv"))
+write.csv(nbr_stg[,.(.N,recover_y=mean(recover_y,na.rm=T),reco_ysd=sd(recover_y,na.rm=T)),
+                  by=.(is_recover,veg_type)],paste0(p_path,"result/stat_recovery_veg_typ.csv"))
+ggplot(nbr_stg,aes(x=max_years,fill=veg_type))+
+  geom_bar(position = "dodge",alpha=0.6)+
+  theme_bw()+
+  labs(fill="Vegatation type",x="Year")
+ggsave(paste0(p_path,"/result/plot_legg_eff.jpeg"),width=6,height=3)
+
+ggplot(nbr_stg[is_recover==1],aes(x=recover_y,fill=veg_type))+
+  geom_bar(position = "dodge")
+```
+# 4. enviroment variable extract
+擷取各網格之環境資料，並作後續分析
+環境資料分別為：
+1. 坡度、坡向
+2. 海拔
+3. 長期溫度、雨量
+```{r}
+var_path <- list.files(paste0(p_path,"rawdata/layer/raster_factor/"),
+                       full.names = T)
+var_layer <- lapply(var_path,raster)
+var_path
+crs(var_layer[[3]])
+
+nbr_stg <- as.data.frame(nbr_stg)
+nbr_stg <- st_as_sf(nbr_stg,sf_column_name = "wkt")
+nbr_stg$dem <- exact_extract(var_layer[[1]],nbr_stg, fun = "mean") 
+nbr_stg$asp_ind <- exact_extract(var_layer[[2]],nbr_stg, fun = "mean") 
+nbr_stg$temp <- exact_extract(var_layer[[3]],nbr_stg, fun = "mean")
+nbr_stg$pre <- exact_extract(var_layer[[4]],nbr_stg, fun = "mean")
+nbr_stg$slope <- exact_extract(var_layer[[5]],nbr_stg, fun = "mean")
+nbr_stg <- as.data.table(nbr_stg)
+
+### 增加火燒嚴重等級
+nbr_stg[max_dnbr_5y>=100&max_dnbr_5y<269,fire_severity:=1][
+  max_dnbr_5y>=269&max_dnbr_5y<439,fire_severity:=2][
+    max_dnbr_5y>=439&max_dnbr_5y<659,fire_severity:=3]
+nbr_stg[,fire_severity:=factor(fire_severity,levels = c(1,2,3))]
+### 增加是否恢復
+nbr_stg[!is.na(recover_y),is_recover:=1][
+  is.na(recover_y),is_recover:=0]
+### 網格中心座標
+nbr_stg_df <- as.data.frame(nbr_stg)
+nbr_stg_df <- st_as_sf(nbr_stg_df)
+centroid_coord <- nbr_stg_df %>% 
+  st_centroid() %>%
+  st_coordinates()
+
+nbr_stg[,x:=centroid_coord[,1]][,y:=centroid_coord[,2]]
+nbr_stg[,pos:=numFactor(x, y)]
+nbr_stg[,firecode:=factor(firecode)]
+### 進行glmm分析
+#### 是否復原
+colnames(nbr_stg)
+test <- nbr_stg[!is.na(dem)]
+glmm_r_frq <- glmmTMB(is_recover~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+(1|firecode),data = test,family = "binomial")
+summary(randf_r_frq)
+summary(glmm_r_frq)
+model_performance(glmm_r_frq)
+r_frq_fixe <- summary(glmm_r_frq)
+
+#### 檢視個別變數的效應
+ggpredict(glmm_r_frq,terms="slope")
+
+ggplot(frq_slop_eff, aes(x = x, y = predicted)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  labs(x = "X1", y = "Predicted Y") +
+  theme_minimal()
+
+plot(glmm_r_f_eff)
+nrow(nbr_stg[is.na(recover_y)])/nrow(nbr_stg)*100
+
+glmm_r_rcy <- glmmTMB(recover_y~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+mat(pos+0|firecode),
+                      data = nbr_stg[recover_y>0],na.action = na.omit,
+                      family = poisson)
+summary(glmm_r_rcy)
+model_performance(glmm_r_rcy)
+  nbr_stg[,slope_g:=cut(slope,breaks=seq(0,70,by=10),
+                      labels = c("0-10","10-20","20-30",
+                                 "30-40","40-50","50-60","60-70"))]
+slp_recov_stat <- nbr_stg[,.N,by=.(slope_g,is_recover)]
+slp_recov_stat[,is_recover:=factor(is_recover,levels = c(0,1))]
+ggplot(data=slp_recov_stat[!is.na(slope_g)],
+       aes(x=slope_g,y=N,fill=is_recover))+
+  geom_col(position = "fill",width=0.5)
+### 火燒恢復時間與植群
+nbr_stg[,.(rcov_y_m=mean(recover_y,na.rm=T),rcov_y_sd=sd(recover_y,na.rm = T)),
+        by=.(veg_type)]
+nbr_stg[is_recover==0,2024-fire_year]
+
+
+```
+# 5. finding the climate event 
+查找到使植群進一步衰退的因子。
+可能有第二次火燒以及崩塌(颱風)
+轉換思維，檢視沒有復原的區域原因。
+採用分段回歸的方式，來檢視數值驟降的年份
+```{r}
+
+### 分段回歸
+#### 利用分段回歸找到驟升驟降的年份
+b_stat_r <- lapply(unique(nbr_f$id),function(gid){
+  test <- nbr_f[id==gid&year_ord>1]
+  test_seg_r <- tryCatch(
+    expr = {
+      test[,dnbr:=ts(dnbr,start=min(nbr_year),frequency = 1)]
+      bp <- breakpoints(test$dnbr~test$nbr_year)
+      break_year <- breakdates(bp)
+      test_r <- data.table(id=gid,year=test$nbr_year,
+                             fit=fitted(bp))
+      test_r[,diff:=c(diff(fit),NA)]
+      test_r <- test_r[year %in% break_year]
+      return(test_r)
+    },
+    error = function(e){
+    error_r <- data.table(id=gid)
+    return(error_r)
+    }
+  )
+})
+bp_sts <- rbindlist(b_stat_r,fill=T)
+#### 檢視break point的nbr值
+colnames(nbr_f)
+nbr_f[,after_bp_y:=nbr_year-1]
+bp_sts_2 <- nbr_f[,.(after_bp_y,id,nbr,d_dnbr,dnbr)][
+  bp_sts,on=.(after_bp_y=year,id)]
+ref_id <- nbr_f[re_fire==1,.(re_fire,id,nbr_year)]
+
+### 計算各年分驟升網格比例
+
+
+bp_sts <- ref_id[bp_sts,on=.(id,nbr_year=year)]
+bp_sts[diff<0,trend:="-"][diff>0,trend:="+"]
+bp_sts[trend=="+",.(.N/1730*100),by=.(nbr_year)]
+ggplot(bp_sts[trend=="+",.(.N/1730*100),by=.(nbr_year)],aes(x=nbr_year,y=V1))+
+  geom_col()
+### 檢視數據驟降(快速恢復)的網格，並看看這些是否有復原
+bp_sts[id=="n_8035"]
+nbr_stg[id=="n_2533"]$wkt
+bp_sts_2[id=="n_2533"]
+ggplot(nbr_f[id=="n_2533"],aes(x=nbr_year,y=dnbr))+
+  geom_line()+
+  scale_x_continuous(breaks = seq(1990,2023,2))
+
+
+### 排除掉驟升或驟降在火燒已經復原之後的次數
+nbr_stg[,recover_year:=fire_year+recover_y]
+bp_sts_exroc <- bp_sts[nbr_stg[,.(id,recover_year,fire_year)],on=.(id)]
+length(unique(bp_sts_exroc$id))
+bp_sts_exroc <- bp_sts_exroc[(nbr_year<=recover_year|is.na(recover_year))]
+
+### 檢視驟升(惡化，崩塌、再次火燒)或驟降(快速恢復，造林)次數是否影響是否復原
+colnames(bp_sts_exroc)
+
+rev_t <- dcast(bp_sts_exroc,id~trend,fill=0)
+rev_t[,`NA`:=NULL]
+setnames(rev_t,c("+","-"),c("inc","dec"))
+nbr_stg_bp <- rev_t[nbr_stg,on=.(id)]
+nbr_stg_bp[is.na(inc),inc:=0][is.na(dec),dec:=0]
+nbr_stg_bp[,is_inc:=ifelse(inc>0,1,0)][,is_dec:=ifelse(dec>0,1,0)]
+
+```
+# 6 random forest 
+## 6.1 recovery state
+檢視是否植群是否恢復之建模
+```{r}
+#### 進行random forest 分析
+nbr_stg_bp <- nbr_stg_bp[!is.na(dem)]
+nbr_stg_bp[,pass_y:=2023-fire_year]
+nbr_stg_bp[,is_recover:=factor(is_recover, 
+                               levels = c(1, 0), 
+                               labels = c("yes", "no"))]
+
+
+rf_r_frq <- ranger(is_recover~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+inc+dec+pass_y,
+                   data=nbr_stg_bp, 
+                   write.forest = TRUE,
+                   num.trees = 1000,
+                   probability = TRUE,
+                   importance = "permutation")
+x <- nbr_stg_bp[, c("dem", "asp_ind", "slope", 
+                    "pre", "veg_type", "max_dnbr_5y", 
+                    "inc","dec", "pass_y")]  # 去掉截距項
+summary(rf_r_frq)
+rf_r_frq
+importance(rf_r_frq)
+```
+
+## 6.2 shap analysis of recover state
+```{r}
+#### 利用shap分析檢視是否復原
+pfun <- function(object,newdata) {
+  predict(object,newdata)$predictions[, "yes"]
+}
+cl <- makeCluster(10)
+registerDoParallel(cl)
+clusterEvalQ(cl, library(ranger))
+time_take <- system.time({
+shap_v_rc_sta <- fastshap::explain(
+  object = rf_r_frq,
+  X = x,
+  pred_wrapper = pfun,
+  shap_only=FALSE,
+  nsim = 100,
+  parallel = TRUE)
+})
+stopCluster(cl)
+time_take
+sv_sta <- shapviz(shap_v_rc_sta)
+colnames(sv_sta) <- c(
+  "Elevation",
+  "Aspect index",
+  "Slope",
+  "Annual precipitation",
+  "Vegetation type",
+  "Fire severity",
+  "Postfire disturbance",
+  "Reforestation",
+  "Years after fire"
+)
+sv_importance(sv_sta, kind = "beeswarm")
+sv_importance(sv_sta, kind = "no")
+ggsave(paste0(p_path,"result/plot/shap_beewarm_stat.jpeg"),
+       width = 7,height=5)
+sv_dependence(sv_sta, v = "Elevation")+
+  scale_x_continuous(breaks=seq(600,4000,200))
+
+sv_var <- sv_importance(sv_sta, kind = "bar",show=FALSE)$data$feature
+
+sv_plot <- lapply(sv_var,function(var){
+   p <- sv_dependence(sv_sta, v = as.character(var),
+              color_var="Fire severity",alpha=0.5)+
+     geom_hline(yintercept = 0,lty="dashed",color="gray30")+
+     theme_bw()
+   ggsave(paste0(p_path,"result/plot/rf_result/beewarm_rec_sta_",
+                 var,".jpeg"),
+          width = 7,height=5,plot=p)
+   return(p)
+})
+wrap_plots(sv_plot, ncol = 3,
+           guides="collect",
+           axis_titles="collect_y",
+           tag_level = "new")+
+  plot_annotation(tag_levels = "A")
+ggsave(paste0(p_path,"result/plot/SHAP_all_var_stat.jpeg"),
+       width=12,height = 9,dpi=600)
+```
+## 6.3 recover year
+檢視是否植群恢復所需年之建模
+```{r}
+#### 進行random forest 分析
+rf_recov_y <- nbr_stg_bp[!is.na(recover_y)]
+rf_r_rcvy <- ranger(recover_y~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+inc,
+                   data=rf_recov_y, 
+                   write.forest = TRUE,
+                   num.trees = 1000,
+                   importance="permutation")
+x_rcy <- rf_recov_y[, c("dem", "asp_ind", "slope", 
+                    "pre", "veg_type", "max_dnbr_5y", 
+                    "inc")] 
+summary(rf_r_rcvy)
+importance(rf_r_rcvy)
+rf_r_rcvy
+rf_r_rcvy$r.squared
+ranger::importance(rf_r_rcvy)
+```
+
+## 6.4 shap analysis of recover years
+```{r}
+#### 利用shap分析檢視是否復原
+pfun_rcy <- function(object,newdata) {
+  predict(object,newdata)$predictions
+}
+pfun_rcy(rf_r_rcvy,x_rcy)
+cl <- makeCluster(10)
+registerDoParallel(cl)
+clusterEvalQ(cl, library(ranger))
+time_take <- system.time({
+shap_v_rc_y <- fastshap::explain(
+  object = rf_r_rcvy,
+  X = x_rcy,
+  pred_wrapper = pfun_rcy,
+  shap_only=FALSE,
+  nsim = 100,
+  parallel = TRUE)
+})
+
+stopCluster(cl)
+time_take
+sv_rcy <- shapviz(shap_v_rc_y)
+
+
+colnames(sv_rcy) <- c(
+  "Elevation",
+  "Aspect index",
+  "Slope",
+  "Annual precipitation",
+  "Vegetation type",
+  "Fire severity",
+  "Postfire disturbance")
+sv_importance(sv_rcy, kind = "beeswarm",viridis_args= getOption("D"))
+sv_importance(sv_rcy, kind = "no")
+ggsave(paste0(p_path,"result/plot/shap_beewarm_recov_y.jpeg"),
+       width = 7,height=5)
+sv_waterfall(sv_rcy)
+sv_var_rcy <- sv_importance(sv_rcy, kind = "bar",show=FALSE)$data$feature
+
+sv_rcy_plot <- lapply(sv_var_rcy,function(var){
+   p <- sv_dependence(sv_rcy, v = as.character(var),
+              color_var="Fire severity",color="#AF0900",
+              alpha=0.5,viridis_args= getOption("D"))+
+     geom_hline(yintercept = 0,lty="dashed",color="gray30")+
+     theme_bw()
+   ggsave(paste0(p_path,"result/plot/rf_result/beewarm_recy_",
+                 var,".jpeg"),
+          width = 7,height=5,plot=p)
+   return(p)
+})
+wrap_plots(sv_rcy_plot, ncol = 3,
+           guides="collect",
+           axis_titles="collect_y",
+           tag_level = "new")+
+  plot_annotation(tag_levels = "A")
+ggsave(paste0(p_path,"result/plot/SHAP_all_var_recy.jpeg"),width=12,height = 9,dpi=600)
+
+```
+## 6.5 spetial autocorrelation
+```{r}
+library(spdep)
+### for recover state
+test_au <-data.table(nbr_stg_bp[,.(id,is_recover,recover_y,x,y)],
+                     rf_r_frq$predictions)
+test_au[,pred:=ifelse(yes>no,1,0)][,obsP:=ifelse(is_recover=="yes",1,0)]
+test_au[,residual:=obsP-pred]
+coords_nb <- dnearneigh(as.matrix(coords), 0, max(dist_matrix))
+coords <- test_au[, c("x", "y")]
+dist_matrix <- dist(coords)
+coords_nb <- dnearneigh(as.matrix(coords), 0, max(dist_matrix))
+weights <- nb2listw(coords_nb, style = "W")
+aucor_r <- moran.test(test_au$residual, weights)
+aucor_r
+### for recover year
+test_au <-data.table(nbr_stg_bp[is_recover=="yes",.(id,recover_y,x,y)],
+                     pred=rf_r_rcvy$predictions)
+test_au[,residual:=recover_y-pred]
+coords <- test_au[, c("x", "y")]
+dist_matrix <- dist(coords)
+coords_nb <- dnearneigh(as.matrix(coords), 0, 50000)
+weights <- nb2listw(coords_nb, style = "W")
+aucor_r_2 <- moran.test(test_au$residual, weights)
+aucor_r_2 
 
 ```
 
