@@ -200,11 +200,6 @@ nbr_stg$pre <- exact_extract(var_layer[[4]],nbr_stg, fun = "mean")
 nbr_stg$slope <- exact_extract(var_layer[[5]],nbr_stg, fun = "mean")
 nbr_stg <- as.data.table(nbr_stg)
 
-### 增加火燒嚴重等級
-nbr_stg[max_dnbr_5y>=100&max_dnbr_5y<269,fire_severity:=1][
-  max_dnbr_5y>=269&max_dnbr_5y<439,fire_severity:=2][
-    max_dnbr_5y>=439&max_dnbr_5y<659,fire_severity:=3]
-nbr_stg[,fire_severity:=factor(fire_severity,levels = c(1,2,3))]
 ### 增加是否恢復
 nbr_stg[!is.na(recover_y),is_recover:=1][
   is.na(recover_y),is_recover:=0]
@@ -218,41 +213,6 @@ centroid_coord <- nbr_stg_df %>%
 nbr_stg[,x:=centroid_coord[,1]][,y:=centroid_coord[,2]]
 nbr_stg[,pos:=numFactor(x, y)]
 nbr_stg[,firecode:=factor(firecode)]
-### 進行glmm分析
-#### 是否復原
-colnames(nbr_stg)
-test <- nbr_stg[!is.na(dem)]
-glmm_r_frq <- glmmTMB(is_recover~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+(1|firecode),data = test,family = "binomial")
-summary(randf_r_frq)
-summary(glmm_r_frq)
-model_performance(glmm_r_frq)
-r_frq_fixe <- summary(glmm_r_frq)
-
-#### 檢視個別變數的效應
-ggpredict(glmm_r_frq,terms="slope")
-
-ggplot(frq_slop_eff, aes(x = x, y = predicted)) +
-  geom_line() +
-  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
-  labs(x = "X1", y = "Predicted Y") +
-  theme_minimal()
-
-plot(glmm_r_f_eff)
-nrow(nbr_stg[is.na(recover_y)])/nrow(nbr_stg)*100
-
-glmm_r_rcy <- glmmTMB(recover_y~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+mat(pos+0|firecode),
-                      data = nbr_stg[recover_y>0],na.action = na.omit,
-                      family = poisson)
-summary(glmm_r_rcy)
-model_performance(glmm_r_rcy)
-  nbr_stg[,slope_g:=cut(slope,breaks=seq(0,70,by=10),
-                      labels = c("0-10","10-20","20-30",
-                                 "30-40","40-50","50-60","60-70"))]
-slp_recov_stat <- nbr_stg[,.N,by=.(slope_g,is_recover)]
-slp_recov_stat[,is_recover:=factor(is_recover,levels = c(0,1))]
-ggplot(data=slp_recov_stat[!is.na(slope_g)],
-       aes(x=slope_g,y=N,fill=is_recover))+
-  geom_col(position = "fill",width=0.5)
 ### 火燒恢復時間與植群
 nbr_stg[,.(rcov_y_m=mean(recover_y,na.rm=T),rcov_y_sd=sd(recover_y,na.rm = T)),
         by=.(veg_type)]
@@ -304,13 +264,6 @@ bp_sts[diff<0,trend:="-"][diff>0,trend:="+"]
 bp_sts[trend=="+",.(.N/1730*100),by=.(nbr_year)]
 ggplot(bp_sts[trend=="+",.(.N/1730*100),by=.(nbr_year)],aes(x=nbr_year,y=V1))+
   geom_col()
-### 檢視數據驟降(快速恢復)的網格，並看看這些是否有復原
-bp_sts[id=="n_8035"]
-nbr_stg[id=="n_2533"]$wkt
-bp_sts_2[id=="n_2533"]
-ggplot(nbr_f[id=="n_2533"],aes(x=nbr_year,y=dnbr))+
-  geom_line()+
-  scale_x_continuous(breaks = seq(1990,2023,2))
 
 
 ### 排除掉驟升或驟降在火燒已經復原之後的次數
@@ -328,6 +281,10 @@ setnames(rev_t,c("+","-"),c("inc","dec"))
 nbr_stg_bp <- rev_t[nbr_stg,on=.(id)]
 nbr_stg_bp[is.na(inc),inc:=0][is.na(dec),dec:=0]
 nbr_stg_bp[,is_inc:=ifelse(inc>0,1,0)][,is_dec:=ifelse(dec>0,1,0)]
+### 比較植群型的恢復時間
+wilcox.test(nbr_stg_bp[veg_type=="F"&!is.na(recover_y)]$recover_y,
+            nbr_stg_bp[veg_type=="GS"&!is.na(recover_y)]$recover_y, 
+            alternative = "two.sided")
 
 ```
 # 6 random forest 
@@ -350,7 +307,7 @@ rf_r_frq <- ranger(is_recover~dem+asp_ind+slope+pre+veg_type+max_dnbr_5y+inc+dec
                    importance = "permutation")
 x <- nbr_stg_bp[, c("dem", "asp_ind", "slope", 
                     "pre", "veg_type", "max_dnbr_5y", 
-                    "inc","dec", "pass_y")]  # 去掉截距項
+                    "inc","dec", "pass_y")]  
 summary(rf_r_frq)
 rf_r_frq
 importance(rf_r_frq)
@@ -386,10 +343,9 @@ colnames(sv_sta) <- c(
   "Fire severity",
   "Postfire disturbance",
   "Reforestation",
-  "Years after fire"
+  "Time since fire"
 )
 sv_importance(sv_sta, kind = "beeswarm")
-sv_importance(sv_sta, kind = "no")
 ggsave(paste0(p_path,"result/plot/shap_beewarm_stat.jpeg"),
        width = 7,height=5)
 sv_dependence(sv_sta, v = "Elevation")+
@@ -495,6 +451,8 @@ ggsave(paste0(p_path,"result/plot/SHAP_all_var_recy.jpeg"),width=12,height = 9,d
 
 ```
 ## 6.5 spetial autocorrelation
+檢驗`是否恢復`以及`恢復年限`是否有空間自相關，若是有空間自相關，則必須處理。
+
 ```{r}
 library(spdep)
 ### for recover state
@@ -502,8 +460,9 @@ test_au <-data.table(nbr_stg_bp[,.(id,is_recover,recover_y,x,y)],
                      rf_r_frq$predictions)
 test_au[,pred:=ifelse(yes>no,1,0)][,obsP:=ifelse(is_recover=="yes",1,0)]
 test_au[,residual:=obsP-pred]
-coords_nb <- dnearneigh(as.matrix(coords), 0, max(dist_matrix))
 coords <- test_au[, c("x", "y")]
+coords_nb <- dnearneigh(as.matrix(coords), 0, max(dist_matrix))
+
 dist_matrix <- dist(coords)
 coords_nb <- dnearneigh(as.matrix(coords), 0, max(dist_matrix))
 weights <- nb2listw(coords_nb, style = "W")
@@ -519,7 +478,6 @@ coords_nb <- dnearneigh(as.matrix(coords), 0, 50000)
 weights <- nb2listw(coords_nb, style = "W")
 aucor_r_2 <- moran.test(test_au$residual, weights)
 aucor_r_2 
-
 ```
 
 

@@ -11,11 +11,21 @@ library(tidyverse)
 library(sf)
 library(parallel)
 library(raster)
+library(ranger)
+library(spmoran)  # MEM 計算
+library(nngeo) # st_nn
 library(exactextractr) 
 library(SPEI)
-library(randomForest)
-
-p_path <- "G:/我的雲端硬碟/協助分析/又綾/國家公園火燒風險評估/"
+library(patchwork)
+library(scales)
+library(fastshap) # for shap analysis
+library(future) # speed up
+library(shapviz) # shap plot
+library(doParallel) # speed up the shap analysis
+library(lubridate) # date calculate
+library(ggnewscale) # two color scale
+library(colorspace) # color palettes
+p_path <- "G:/我的雲端硬碟/進行中的研究案/Fire risk/"
 ```
 
 # 1. creating grid
@@ -34,13 +44,15 @@ rm(bs_grid)
 ### 擷取火燒範圍
 fire_grid <- st_join(bs_grid_sf,fire_rg)
 fire_grid <- fire_grid[!is.na(fire_grid$fid),]
-st_write(fire_grid,paste0(p_path,"rawdata/fire_region_grid.shp"))
+st_write(fire_grid,paste0(p_path,"rawdata/layer/fire_region_grid.shp"))
 ```
 # 2. 處理veg ind
 以火燒時間擷取NDVI, NBR以及NDMI數值。
 NDVI與NDMI取前一年資料，作為火燒前背景。
 NBR火燒前一年與火燒後一年差值，作為火燒嚴重數值。
 ```{r}
+fire_grid <- st_read(paste0(p_path,"rawdata/layer/fire_region_grid.shp"))
+
 ## 設立資料路徑
 veg_rast_path <-paste0(p_path,"rawdata/layer/vegetation_index/")
 
@@ -50,7 +62,9 @@ fire_grid <- fire_grid[fire_grid$year>1986,]
 
 fire_g2 <- lapply(unique(fire_grid$year),function(year){
   test <- fire_grid[fire_grid$year==year,]
-  test_rast_pre <- stack(paste0(veg_rast_path,"nbr_mean_",as.numeric(year)-1,
+
+  test_rast_pre <- stack(paste0(veg_rast_path,"nbr_mean_",
+                                  as.numeric(year)-1,
                                 ".tif"))
   test_rast_aft <- stack(paste0(veg_rast_path,"nbr_mean_",as.numeric(year)+1,
                                 ".tif"))
@@ -68,14 +82,15 @@ fire_g2$id <- paste0("n_",1:nrow(fire_g2))
 fire_gp <- st_centroid(fire_g2)
 
 write.csv(fire_gp,paste0(p_path,"result/grid_point.csv"))
+rm(fire_grid,fire_rg)
 ```
 
 # 3. ERA5_data deal
-利用逐年的ERA5圖層，計算spei指標
-該圖層一年一張，內有兩個波段，分別為降雨與潛在蒸散量。
+利用網格的中心點，擷取ERA5的數值，排除掉重複點位，以最少點位從gee下載ERA5資料，
+，計算spei數值，並得到不同點位的逐年spei變化。
 ```{r}
 ## test
-ts_layer <- raster(paste0(p_path,"rawdata/layer/ERA5/ERA5_1951-0000000000-0000000000.tif"))
+ts_layer <- raster(paste0(p_path,"rawdata/layer/ERA5/ERA5_19500101.tif"))
 
 ts_dt <- raster::extract(ts_layer,fire_gp) %>% as.data.table()
 ts_dt <- data.table(fire_gp[,c("id")],ts_dt)
@@ -87,9 +102,13 @@ write.csv(bs_dt,paste0(p_path,"/result/spei_point.csv"))
 rm(ts_layer,test)
 ### 處理雲端下來的資test### 處理雲端下來的資料
 spei <- fread(paste0(p_path,"rawdata/NP_fire_monthly_1950_2023_12_31.csv"))
-spei[,grp:=bs_dt$grp]
-spei[,`system:index`:=NULL][,.geo:=NULL][,id:=NULL]
+setnames(spei,"era5_id","grp")
 
+rmcol <- colnames(spei)[(ncol(spei)-10):ncol(spei)]
+rmcol <- rmcol[-c(1,6)]
+spei[,(rmcol):=NULL]
+rm(rmcol)
+spei[,`system:index`:=NULL]
 spei_t <- melt(spei, id.vars=c("grp"),variable.name = "var",value.name="value")
 spei_t[,year:=str_sub(var, start = 1, end = 4)][
   ,month:=str_sub(var,5,6)][
@@ -98,18 +117,20 @@ spei_t[,year:=str_sub(var, start = 1, end = 4)][
 spei <- dcast(spei_t,year+month+grp~var_name,value.var = "value")
 
 setnames(spei,c("potential_evaporation_sum",
-              "total_precipitation_sum"),
-         c("PE","precip"))
-spei <- spei[!is.na(PE)][,V1:=NULL]
+              "total_precipitation_sum","temperature_2m"),
+         c("PE","precip","temp"))
 
 spei[,c("PE","precip"):=.(PE*1000,precip*1000)][
-  ,D:=precip+PE]
+  ,D:=precip+PE][,temp:=temp-273.15]
 for (i in unique(spei$grp)){
   spei[grp==i,spei_3:=as.data.table(spei(D,3)$fitted)][
         grp==i,spei_6:=as.data.table(spei(D,6)$fitted)][
          grp==i,spei_12:=as.data.table(spei(D,12)$fitted)][
-           grp==i,spei_24:=as.data.table(spei(D,24)$fitted)]
+           grp==i,spei_24:=as.data.table(spei(D,24)$fitted)][
+             grp==i,temp_ind:=(temp-mean(temp))/sd(temp)
+           ]
 }
+write.csv(spei,paste0(p_path,"result/SPEI.csv"))
 ### 合併資料
 ts_dt <- as.data.table(ts_dt)
 ts_dt[,geometry:=NULL][,var:=NULL]
@@ -117,109 +138,760 @@ fire_gdt <- as.data.table(fire_g2)
 fire_gdt <- fire_gdt[ts_dt,on=.(id)]
 fire_gdt[,month:=str_sub(firecode,5,6)]
 colnames(spei)
-fire_gdt <- spei[,.(year,month,grp,spei_3,spei_6,spei_12,spei_24)][
+fire_gdt <- spei[,.(year,month,grp,spei_3,spei_6,spei_12,spei_24,
+                    temp,precip,PE,D,temp_ind)][
   fire_gdt,on=.(year,month,grp)]
-rm(spei_t,spei)
+rm(spei_t,ts_dt,ts_layer,bs_dt)
 ```
 # 4. single raster factor
 處理坡度、坡向、TWI指數
 ```{r}
 
 s_rf_path <- list.files(paste0(p_path,"/rawdata/layer/raster_factor/"),
+                        pattern = ".tif$",
                         full.names = TRUE)
-
+s_rf_path
 rf_layer <- lapply(s_rf_path,raster)
-fire_gdt$asp_recl <- exact_extract(rf_layer[[1]],fire_grid, fun = "mean")
-fire_gdt$slope <- exact_extract(rf_layer[[2]],fire_grid, fun = "mean")
-fire_gdt$twi <- exact_extract(rf_layer[[3]],fire_grid, fun = "mean")
+{fire_gdt$dem <- exact_extract(rf_layer[[1]],fire_grid,fun="mean")
+fire_gdt$asp_moi <- exact_extract(rf_layer[[2]],fire_grid, fun = "mean")
+fire_gdt$slope <- exact_extract(rf_layer[[3]],fire_grid, fun = "mean")
+fire_gdt$twi <- exact_extract(rf_layer[[4]],fire_grid, fun = "mean")
+}
+
 rm(rf_layer)
 ```
+
 # 5. human impact factor
-處理山屋、山徑以及道路三項因子
+處理山屋、山徑、林道與省道四項人為構造因子
 ```{r}
-### 山屋
-hf_str <- st_read(paste0(p_path,"rawdata/layer/vector_factor/山屋_FINAL2.shp"))
-hf_str_j <-st_intersection(fire_g2[,c("id")],hf_str,left = TRUE) 
-hf_str_j <- hf_str_j[!is.na(hf_str_j$fid),]
-hf_str_j$area <-st_area(hf_str_j) 
-hf_str_j <- as.data.table(hf_str_j)
-hf_str_j[,area:=as.numeric(area)]
-hf_str_l <- hf_str_j[,.(h_str_level=sum(level*area)/10000),by=.(id)]
+### loading the settlement layer
+layers <- st_layers(paste0(p_path,"/rawdata/layer/vector_factor/vector_factor.gpkg"))$name
+settlement <- lapply(layers, st_read, 
+                   dsn =(paste0(p_path,
+                      "/rawdata/layer/vector_factor/vector_factor.gpkg")))
+names(settlement) <- layers
+### calculate the distance of each factor
 
-fire_gdt <- hf_str_l[fire_gdt,on=.(id)]
-fire_gdt[is.na(h_str_level),h_str_level:=0]
-#### 修正風險等級，應該是距離山屋越近，風險等級越高(1~4改成4~1)
-fire_gdt[h_str_level>0,h_str_level:=5-h_str_level]
-rm(hf_str,hf_str_j)
-### 路徑
-hf_hiking_r <- st_read(paste0(p_path,"rawdata/layer/vector_factor/路徑_final2.shp"))
-hf_hr_j <-st_intersection(fire_g2[,c("id")],hf_hiking_r,left=TRUE) 
-hf_hr_j <- hf_hr_j[!is.na(hf_hr_j$fid),]
-hf_hr_j$area <- st_area(hf_hr_j) 
-hf_hr_j <- as.data.table(hf_hr_j)
-hf_hr_l <- hf_hr_j[,.(hf_hr_level=sum(level*area/sum(area))),by=.(id)]
-hf_hr_l[,hf_hr_level:=as.numeric(hf_hr_level)]
-fire_gdt <- hf_hr_l[fire_gdt,on=.(id)]
-fire_gdt[is.na(hf_hr_level),hf_hr_level:=0]
-#### 修正風險等級，應該是距離路越近，風險等級越高(1~4改成4~1)
-fire_gdt[hf_hr_level>0,hf_hr_level:=5-hf_hr_level]
-rm(hf_hr_j,hf_hiking_r)
-### 省道
-hf_road_r <- st_read(paste0(p_path,"rawdata/layer/vector_factor/省道_final.gpkg"))
-hf_ro_j <-st_intersection(fire_g2[,c("id")],hf_road_r,left=TRUE) 
-
-hf_ro_j$area <- st_area(hf_ro_j) 
-hf_ro_j <- as.data.table(hf_ro_j)
-hf_ro_l <- hf_ro_j[,.(hf_ro_level=sum(level*area/sum(area))),by=.(id)]
-hf_ro_l[,hf_ro_level:=as.numeric(hf_ro_level)]
-fire_gdt <- hf_ro_l[fire_gdt,on=.(id)]
-fire_gdt[is.na(hf_ro_level),hf_ro_level:=0]
-rm(hf_ro_j,hf_road_r)
-write.csv(fire_gdt,paste0(p_path,"result/fire_grid_and_all_factor.csv"))
+dis_settle <- lapply(layers,function(ly_name){
+  test <- st_nn(fire_gp,settlement[[ly_name]],k=1,returnDist = TRUE)
+  dt <- data.table(id=fire_gp$id, var=ly_name,dist= unlist(test$dist))
+  return(dt)
+  })
+dis_settle <- rbindlist(dis_settle)
+colnames(dis_settle)
+dis_set_t <- dcast(id~var,data=dis_settle,value.var = "dist")
+colnames(dis_set_t)
+setnames(dis_set_t,c("forest_road","main_road","settlement and camp","tracks"),
+         c("f_road","m_road","camp","track"))
+fire_gdt2 <- fire_gdt[dis_set_t,on=.(id)]
+rm(dis_settle,dis_set_t,settlement,test)
+rm(fire_gdt,fire_gp,fire_grid)
+write.csv(fire_gdt2,paste0(p_path,"rawdata/fire_bs_data.csv"))
 ```
-# ramdon forest
 
+# 6. ramdon forest
+## 6.1 basic model
 ```{r}
-colnames(fire_gdt)
-fire_gdt[is.na(twi)]
-fire_gdt[,p_wi:=ndmi/ndvi]
+fire_gdt2 <- as.data.table(fire_gdt2)
+
+
+nrow(fire_gdt2[dnbr>0])
+fire_gdt2[,p_vmi:=ndmi/ndvi]
 fire_gdt_fire <- fire_gdt2[dnbr>0]
-rf_mod_r <- randomForest(dnbr~hf_hr_level+hf_ro_level+h_str_level+spei_3+
-                           spei_6+spei_12+spei_24+p_wi+asp_recl+
-                           slope+twi+ndvi+ndmi,
-                         data=fire_gdt,
-                         mtry=4,
-                         type= "regression",
-                         na.action = na.omit,
-                         ntree=200)
-rf_mod_r
-importance(rf_mod_r)
-plot(rf_mod_r)
-importance (rf_mod_r,type=1)
-varImpPlot(rf_mod_r,type=1)
-partialPlot(rf_mod_r,fire_gdt[!is.na(twi)],x.var = "twi")
+colnames(fire_gdt_fire)
+x <- fire_gdt_fire[,c("spei_3","spei_6","temp_ind",
+                    "ndvi","ndmi","dem","asp_moi","slope","twi",
+                    "f_road","m_road","camp","track")]
+y <- fire_gdt_fire$dnbr
+rf_r_1<- ranger(dependent.variable.name = NULL, 
+                  y = y,                      
+                  x = x,                         
+                  replace = FALSE,
+                  num.trees = 1000,
+                  num.threads=30,
+                  importance = "permutation")
 
-## part II 將火燒變成有無
-class(fire_gdt)
-fire_gdt[,fir_fq:=NULL]
-fire_gdt[dnbr<50,fir_fq:=0][dnbr>=50,fir_fq:=1]
-fire_gdt[,fir_fq:=factor(fir_fq)][,spei_ins:=spei_3*spei_12]
-rf_mod_r2 <- randomForest(fir_fq~hf_hr_level+hf_ro_level+h_str_level+spei_3+
-                          spei_6+spei_12+spei_24+ndvi+asp_recl+
-                          slope+twi+p_wi,
-                          data=fire_gdt,
-                          mtry=4,
-                          ntree=1000,
-                          type="classification",
-                          na.action = na.omit)
+rf_r_1
+summary(rf_r_1)
+importance(rf_r_1)
 
+pfun_rfr <- function(object,newdata) {
+  predict(object,newdata)$predictions
+}
+pfun_rfr(rf_r_1,x)
+cl <- makeCluster(30)
+{
+registerDoParallel(cl)
+clusterEvalQ(cl, library(ranger))
 
-rf_mod_r2
-importance(rf_mod_r2)
-plot(rf_mod_r2)
-varImpPlot(rf_mod_r2)
-partialPlot(rf_mod_r2,fire_gdt[!is.na(p_wi)],x.var = "p_wi")
+time_take <- system.time({
+shap_v_fr <- fastshap::explain(
+  object = rf_r_1,
+  X = x,
+  pred_wrapper = pfun_rfr,
+  shap_only=FALSE,
+  nsim = 100,
+  parallel = TRUE)
+})
+stopCluster(cl)
+time_take
+beepr::beep(14)
+}
+sv_fr <- shapviz(shap_v_fr)
+sv_importance(sv_fr, kind = "beeswarm")+theme_bw()
+
+ggsave(paste0(p_path,"result/plot/shap_beewarm.jpeg"),
+       width = 7,height=7)
+sv_var <- sv_importance(sv_fr, kind = "bar",show=FALSE)$data$feature
+sv_plot <- lapply(sv_var,function(var){
+   p <- sv_dependence(sv_fr, v = as.character(var),alpha=0.5,
+                      color_var = "spei_3")+
+     geom_hline(yintercept = 0,lty="dashed",color="gray30")+
+     theme_bw()
+   ggsave(paste0(p_path,"result/plot/rf_result/beewarm_rec_sta_",
+                 var,".jpeg"),
+          width = 7,height=5,plot=p)
+   return(p)
+})
+
+## 6.2 RBR
+
+colnames(fire_gdt_fire)
+x <- fire_gdt_fire[,c("spei_3","spei_6","spei_12","spei_24","temp_ind",
+                    "ndvi","ndmi","dem","asp_moi","slope","twi",
+                    "f_road","m_road","camp","track")]
+fire_gdt_fire[,rbr:=dnbr/(nbr_pre+1.001)]
+y <- fire_gdt_fire$rbr
+rf_r_1<- ranger(dependent.variable.name = NULL, 
+                  y = y,                      
+                  x = x,                         
+                  replace = FALSE,
+                  num.trees = 1000,
+                  num.threads=30,
+                  importance = "permutation")
+
+rf_r_1
+summary(rf_r_1)
+importance(rf_r_1)
+
+pfun_rfr <- function(object,newdata) {
+  predict(object,newdata)$predictions
+}
+pfun_rfr(rf_r_1,x)
+cl <- makeCluster(30)
+{
+registerDoParallel(cl)
+clusterEvalQ(cl, library(ranger))
+
+time_take <- system.time({
+shap_v_fr <- fastshap::explain(
+  object = rf_r_1,
+  X = x,
+  pred_wrapper = pfun_rfr,
+  shap_only=FALSE,
+  nsim = 100,
+  parallel = TRUE)
+})
+stopCluster(cl)
+time_take
+beepr::beep(14)
+}
+sv_fr <- shapviz(shap_v_fr)
+sv_importance(sv_fr, kind = "beeswarm")+theme_bw()
+
+ggsave(paste0(p_path,"result/plot/shap_beewarm.jpeg"),
+       width = 7,height=7)
+sv_var <- sv_importance(sv_fr, kind = "bar",show=FALSE)$data$feature
+sv_plot <- lapply(sv_var,function(var){
+   p <- sv_dependence(sv_fr, v = as.character(var),alpha=0.5,
+                      color_var = "spei_3")+
+     geom_hline(yintercept = 0,lty="dashed",color="gray30")+
+     theme_bw()
+   ggsave(paste0(p_path,"result/plot/rf_result/beewarm_rec_sta_",
+                 var,".jpeg"),
+          width = 7,height=5,plot=p)
+   return(p)
+})
+
 
 ```
 
+
+# 7. 進階處理
+先將資料作進一步處理，再重新建模。
+1. 需要使用五年內最高的dnbr作為代表值來嘗試看看，避免誤算。
+2. 轉換設施的距離數值，改成"接近值"(使用2km作為極限值)
+3. 檢視數據間的共線性問題。
+4. 處理空間自相關的問題。
+
+## 7.1 第一二項處理 
+```{r}
+### 計算逐年dnbr
+class(fire_g2)
+
+fiveyr_mxdnbr <- lapply(unique(fire_g2$year),function(year){
+    test <- fire_g2[fire_g2$year==year,]
+    if(as.numeric(year)>2019)(ord=0:3)else(ord=0:5)
+    test_rast_aft5y <- lapply(ord,function(i){
+      stack(paste0(veg_rast_path,"nbr_mean_",as.numeric(year)+i,
+                                ".tif"))
+    })
+    test_5yr <- lapply(ord,function(yr_ord){
+      nbr_v <- exact_extract(test_rast_aft5y[[yr_ord+1]][[1]],test, fun = "mean")
+      dt <- data.table(test[,c("firecode","year","nbr_pre","id")],
+                       nbr_aft=nbr_v,yr_ord=yr_ord)
+      return(dt)
+    })
+    test_5yr <- rbindlist(test_5yr)
+    max_5yr <- test_5yr[,dnbr2:=(nbr_pre-nbr_aft)*1000][
+                        ,.(max_dnbr_5y=max(dnbr2)),by=.(firecode,id)]
+    return(max_5yr)
+})
+fiveyr_mxdnbr <- rbindlist(fiveyr_mxdnbr)
+fire_gdt3 <- fire_gdt2[fiveyr_mxdnbr,on=.(firecode,id)]
+### 處理距離問題，以2km為界，重新產出
+colnames(fire_gdt3)
+class(fire_gdt3)
+fire_gdt3[, (c("f_rr", "m_rr", "camp_r", "tra_r")) := 
+          lapply(.SD, function(x){
+              clos <- 2000-x
+              clos <- ifelse(clos < 0, 0, clos)
+              return(clos)
+          }),
+          .SDcols = c("f_road", "m_road", "camp", "track")]
+
+spei <- fread(paste0(p_path,"result/spei.csv"))
+
+fire_gdt3[,year:=as.numeric(year)][,month:=as.numeric(month)]
+fire_gdt3 <- spei[fire_gdt3[,-(4:12)],on=.(grp,year,month)]
+fire_gdt3[,V1:=NULL]
+rm(spei)
+```
+
+
+### 7.1.1 重新加入植群乾燥指標
+植群乾燥指標NDMI、NDWI與NDVI是以火燒發生前一季的平均值
+
+```{r}
+grid_id <- fire_gdt3[,.(id,year,month,firecode,geometry)]
+grid_id[,firetime:=substr(firecode,1,6)]
+grid_id <- st_as_sf(grid_id,crs=3826)
+
+
+ndmi_r<- lapply(unique(grid_id$firetime),function(f_time){
+  test <- grid_id[grid_id$firetime==f_time,]
+  test_rast <- stack(paste0(p_path,"rawdata/layer/live_fuel/min_moisture_",
+                                  f_time,".tif"))
+  test_rast
+  test$ndmi <- exact_extract(test_rast[[1]],test, fun = "mean")
+  test$ndwi <- exact_extract(test_rast[[2]],test, fun = "mean")
+  test$ndvi_3m <- exact_extract(test_rast[[3]],test, fun = "mean") 
+  return(test)
+})
+ndmi_r <- rbindlist(ndmi_r)
+ndmi_r[is.na(ndmi)]
+## 資料合併
+fire_gdt4 <- fire_gdt3[ndmi_r[,.(id,firecode,ndmi,ndwi,ndvi_3m)],
+                       on =.(id,firecode)]
+
+fire_gdt4 <- fire_gdt4[!is.na(ndmi)]
+rm(ndmi_r,grid_id)
+fire_gdt4[,nddi:=(ndvi_3m-ndwi)/(ndvi_3m+ndwi)]
+```
+
+
+## 7.2 重作rf
+發現有空間自相關問題，因此改使用考慮空間問題的spatialRF重作rf model
+```{r}
+unique(fire_gdt_fire$firecode)
+fire_gdt_fire <- fire_gdt4[!is.na(max_dnbr_5y)]
+fire_gdt_fire[,rbr:=dnbr/(nbr_pre+1.001)]
+fire_gdt_fire[,max_rbr:=max_dnbr_5y/(nbr_pre+1.001)]
+fire_gdt_fire[,max_rdnbr:=max_dnbr_5y/(abs(nbr_pre))^(1/2)]
+coords <- st_centroid(st_as_sf(fire_gdt_fire)) %>% 
+  st_coordinates() %>% as.data.table() 
+meig <- meigen_f(coords, enum = 85)  # enum = 要幾條
+mem  <- meig$sf %>% as.data.table() # 16 000 × 85
+setnames(mem, sprintf("MEM_%03d", 1:ncol(mem)))
+
+rf_raw_1 <- cbind(fire_gdt_fire,mem)
+### 切分訓練資料與驗證資料
+train_index <- sample(1:nrow(fire_gdt_fire), 0.7 * nrow(fire_gdt_fire)) 
+# 70% 訓練組
+train_data <- rf_raw_1[train_index, ]
+test_data  <- rf_raw_1[-train_index, ]
+
+var_1 <- c("spei_3","spei_6","spei_12","spei_24",
+           "precip","D","temp","temp_ind",
+            "dem","asp_moi","slope","twi",
+            "tra_r","f_rr","m_rr","camp_r",
+            "ndvi","ndmi","ndwi","nddi",colnames(mem))
+
+
+x_1 <- train_data[,..var_1]
+y_1 <- train_data$max_rdnbr
+colnames(x_1)
+time_take <- system.time({
+rf_r1 <- ranger(dependent.variable.name = NULL, 
+                  y = y_1,                      
+                  x = x_1,                         
+                  replace = TRUE,
+                  num.trees = 500,
+                  mtry = 30,
+                  sample.fraction = 0.5,
+                  num.threads=30,
+                  importance= "permutation",
+                  probability = FALSE,
+                  verbose = TRUE)
+})
+saveRDS(rf_r1,paste0(p_path,"result/random_forest_model_max_rdnbr.rds"))
+time_take
+rf_r1
+summary(rf_r1)
+imp_vec <-  importance(rf_r1) 
+head(sort(imp_vec, decreasing = TRUE), 40)   # 前 20 名
+### 驗證結果
+pred <- predict(rf_r1, data = test_data)$predictions
+actual <- test_data$max_rdnbr
+rf_r1$r.squared
+# 若是連續變數，計算 R² 與 RMSE
+r2 <- cor(pred, actual)^2
+rmse <- sqrt(mean((pred - actual)^2))
+
+
+###
+pfun_rfr <- function(object,newdata) {
+  predict(object,newdata)$predictions
+}
+pfun_rfr(rf_r1,x_1)
+x1_samp <- x_1[sample(nrow(x_1), 3000), ]
+cl <- makeCluster(30)
+{
+registerDoParallel(cl)
+clusterEvalQ(cl, library(ranger))
+
+shap_time_tak <- system.time({
+shap_v_fr <- fastshap::explain(
+  object = rf_r1,
+  X = x1_samp,
+  pred_wrapper = pfun_rfr,
+  shap_only=FALSE,
+  nsim = 100,
+  parallel = TRUE)
+})
+stopCluster(cl)
+time_take
+beepr::beep(2)
+}
+
+shap_time_tak
+sv_fr <- shapviz(shap_v_fr)
+env_var_name<- c(
+  "SPEI-3",
+  "SPEI-6",
+  "SPEI-12",
+  "SPEI-24",
+  "Precipitation",
+  "Effective precipitation",
+  "Temperature",
+  "STI",
+  "Elevation",
+  "Aspect index",
+  "Slope",
+  "TWI",
+  "TRP",
+  "FRP",
+  "MRP",
+  "CP",
+  "NDVI",
+  "NDMI",
+  "NDWI",
+  "NDDI"
+)
+var_1
+colnames(sv_fr)
+colnames(sv_fr)[1:20] <- env_var_name
+sv_importance(sv_fr[,env_var_name], kind = "beeswarm")+
+  theme_bw()
+var_imp <- sv_importance(sv_fr[,env_var_name],kind = "no")
+write.csv(var_imp,paste0(p_path,"result/variable_importance_rdnbr.csv"))
+ggsave(paste0(p_path,"result/plot/shap_beewar_maxrdnbr.jpeg"),
+       width = 7,height=7)
+env_var_ord<- c(
+  "SPEI-3",
+  "SPEI-6",
+  "SPEI-12",
+  "SPEI-24",
+  "Temperature",
+  "STI",
+  "Precipitation",
+  "Effective precipitation",
+  "NDVI",
+  "NDMI",
+  "NDWI",
+  "NDDI",
+  "TRP",
+  "FRP",
+  "MRP",
+  "CP",
+  "Elevation",
+  "Aspect index",
+  "Slope",
+  "TWI"
+)
+
+{
+sv_plot <- lapply(env_var_ord,function(var){
+   p <- sv_dependence(sv_fr, v = as.character(var),alpha=0.5,
+                      color_var = c("SPEI-3"))+
+     geom_hline(yintercept = 0,lty="dashed",color="gray30")+
+     theme_bw()+
+     geom_smooth(method = "loess")
+   ggsave(paste0(p_path,"result/plot/rf_result/beewarm_rec_sta_",
+                 var,".jpeg"),
+          width = 7,height=5,plot=p)
+   return(p)
+})
+wrap_plots(sv_plot, ncol = 4,
+           guides="collect",
+           axis_titles="collect_y",
+           tag_level = "new")+
+  plot_annotation(tag_levels = "A")
+ggsave(paste0(p_path,"result/plot/SHAP_fire_serv_max_rdnbr.jpeg"),
+       width=20,height = 15,dpi=600)
+beepr::beep(2)
+}
+sv_waterfall(sv_fr[,env_var_name])
+
+```
+
+## 7.3 分層討論
+將各個變數分類，並且依據分類來探究哪類因子具有較高的重要性。
+
+```{r}
+### 建立類群
+sv_force(sv_fr[,env_var_name], row_id = 2)
+
+collapse <- list(
+  drought_ind= c("SPEI-3","SPEI-6","SPEI-12","SPEI-24"),
+  climate    = c("Precipitation","Effective precipitation",
+                 "Temperature","STI"),
+  topography = c("Elevation","Aspect index","Slope","TWI"),
+  human      = c("TRP","FRP","MRP","CP"),
+  vegetation = c("NDVI","NDMI","NDWI","NDDI"))
+
+
+s_fr <- get_shap_values(sv_fr)      # n × p 
+
+sv_fr_grp <- collapse_shap(s_fr[,1:20], collapse) 
+## 取得群組的全域重要度 ---------------------------
+grp_imp <- colMeans(abs(sv_fr_grp)) |> sort(decreasing = TRUE)
+grp_imp
+write.csv(grp_imp,paste0(p_path,"result/group_importance.csv"))
+```
+# 8. 繪製風險圖
+使用國家公園全區的網格，重新擷取網格內各項因子的平均值，再利用model重新評估區域內的靜態風險值。
+## 8.1 重新創建網格
+```{r}
+NP_region <- st_read(paste0(p_path,"/rawdata/layer/national_park_region/三大高山型國家公園邊界.shp"))
+bs_grid <- st_bbox(c(xmin = 231700, ymin = 2568900,
+                     xmax = 322900, ymax = 2713900), 
+                   crs = st_crs(3826)) %>%
+  st_as_sfc() %>%
+  st_make_grid(., cellsize = c(100, 100), what = "polygons")
+bs_grid_sf <-st_sf(geometry = bs_grid) 
+rm(bs_grid)
+### 擷取國家公園範圍
+np_grid <- st_join(bs_grid_sf,NP_region)
+np_grid <- np_grid[!is.na(np_grid$gid),]
+st_write(np_grid,paste0(p_path,"rawdata/layer/National_Park_region_grid.gpkg"))
+rm(bs_grid_sf,NP_region)
+```
+## 8.2 擷取地形因子資料
+利用國家公園網格擷取地形因子資料，
+```{r}
+rm(ysh_grid,ys_rf_path,rf_ys_layer) 
+np_grid$ng_id <- paste0("ng_",1:nrow(np_grid))
+np_grid <- np_grid[,c("Name","gid","geometry","ng_id")]
+np_rf <- lapply(1:3,function(i){
+    name_list <- c("YS","TK","SB")
+    ys_rf_path <- list.files(paste0(p_path,"/rawdata/layer/raster_factor/",
+                                    name_list[i],"/"),
+                        pattern = ".tif$",
+                        full.names = TRUE)
+    rf_ys_layer <- lapply(ys_rf_path,raster)
+    ysh_grid <- np_grid[np_grid$gid==i,]
+    ysh_grid$asp_moi <- exact_extract(rf_ys_layer[[1]],ysh_grid,fun="mean")
+    ysh_grid$dem <- exact_extract(rf_ys_layer[[2]],ysh_grid, fun = "mean")
+    ysh_grid$slope <- exact_extract(rf_ys_layer[[3]],ysh_grid, fun = "mean")
+    ysh_grid$twi <- exact_extract(rf_ys_layer[[4]],ysh_grid, fun = "mean")
+    return(ysh_grid)
+  })
+
+
+```
+## 8.3 擷取人工設施距離
+```{r}
+layers <- st_layers(paste0(p_path,"/rawdata/layer/vector_factor/vector_factor.gpkg"))$name
+settlement <- lapply(layers, st_read, 
+                   dsn =(paste0(p_path,
+                      "/rawdata/layer/vector_factor/vector_factor.gpkg")))
+names(settlement) <- layers
+### calculate the distance of each factor
+
+np_gp <- lapply(np_rf,function(layer){
+  dt <- st_centroid(layer)
+  dt <- dt[,c("Name","gid","geometry","ng_id")]
+  return(dt)
+})
+np_gp[[1]]
+dis_settle_ys <- lapply(layers,function(ly_name){
+    dt <- np_gp[[1]]
+    test <- st_nn(dt,settlement[[ly_name]],k=1
+                  ,returnDist = TRUE,
+                  parallel = 20)
+    dt <- data.table(id=dt$ng_id, var=ly_name,dist= unlist(test$dist))
+  return(dt)
+  })
+dis_settle_ys[[4]]<- st_nn(dt,settlement[[4]],k=1
+                   ,returnDist = TRUE)
+pro_time <- system.time({ 
+dt <- np_gp[[1]]
+test <- st_nn(dt,settlement[[4]],k=1
+                  ,returnDist = TRUE)
+
+rdt <- data.table(id=dt$ng_id, var=layers[4],dist= unlist(test$dist))
+})
+dis_settle_ys <- rbindlist(dis_settle_ys)
+dis_set_t <- dcast(id~var,data=dis_settle_ys,value.var = "dist")
+colnames(dis_set_t)
+setnames(dis_set_t,c("forest_road","main_road","settlement and camp","tracks"),
+         c("f_road","m_road","camp","track"))
+layers
+pro_time <- system.time({
+dis_settle_tk <- lapply(layers[1:3],function(ly_name){
+    dt <- np_gp[[2]]
+    test <- st_nn(dt,settlement[[ly_name]],k=1
+                  ,returnDist = TRUE,maxdist = 2000,
+                  parallel = 20)
+    dist_t <- lapply(1:length(test$dist),function(j){
+            x <- test$dist[[j]]
+            if (length(x)==0){i <- 9999}else{i <- x}
+            return(i)
+    })
+  dt <- data.table(id=dt$ng_id, var=ly_name,dist= unlist(dist_t))
+  return(dt)
+  })
+beepr::beep(2)
+})
+pro_time
+dt <- np_gp[[2]]
+test <- st_nn(dt,settlement[[4]],k=1,maxdist = 2000,returnDist = TRUE)
+dist_t <- lapply(1:length(test$dist),function(j){
+            x <- test$dist[[j]]
+            if (length(x)==0){i <- 9999}else{i <- x}
+            return(i)})
+
+sett_dt <- data.table(id=dt$ng_id, var=layers[4],dist= unlist(dist_t))
+dis_settle_tk[[4]] <- sett_dt
+dist_t
+rm(sett_dt,dt,test,dist_t)
+
+pro_time <- system.time({
+dis_settle_sb <- lapply(layers[1:3],function(ly_name){
+    dt <- np_gp[[3]]
+    test <- st_nn(dt,settlement[[ly_name]],k=1,
+                  returnDist = TRUE,
+                  parallel = 20)
+    dist_t <- lapply(1:length(test$dist),function(j){
+            x <- test$dist[[j]]
+            if (length(x)==0){i <- 9999}else{i <- x}
+            return(i)
+    })
+  dt <- data.table(id=dt$ng_id, var=ly_name,dist= unlist(dist_t))
+  return(dt)
+  })
+beepr::beep(2)
+})
+dt <- np_gp[[3]]
+test <- st_nn(dt,settlement[[4]],k=1,maxdist = 2000,returnDist = TRUE)
+dist_t <- lapply(1:length(test$dist),function(j){
+            x <- test$dist[[j]]
+            if (length(x)==0){i <- 9999}else{i <- x}
+            return(i)})
+
+sett_dt <- data.table(id=dt$ng_id, var=layers[4],dist= unlist(dist_t))
+dis_settle_sb[[4]] <- sett_dt
+rm(sett_dt,dt,test,dist_t)
+dis_settle_ys[,gid:=1]
+dis_settle_sb <- rbindlist(dis_settle_sb) %>% .[,gid:=3]
+dis_settle_tk <- rbindlist(dis_settle_tk) %>% .[,gid:=2]
+dis_sett_all <- rbind(dis_settle_ys,dis_settle_tk,dis_settle_sb)
+dis_sett_all[,dist:=2000-dist]
+dis_sett_all[,dist:=ifelse(dist<=0,0,dist)]
+
+dis_set_all_t <- dcast(id+gid~var,data=dis_sett_all,value.var = "dist")
+colnames(dis_set_all_t)
+setnames(dis_set_all_t,c("forest_road","main_road","settlement and camp","tracks"),
+         c("f_road","m_road","camp","track"))
+### 合併資料
+np_rf_all <- rbindlist(np_rf) 
+colnames(dis_set_all_t)
+np_rf_all <- np_rf_all[dis_set_all_t,on=.(ng_id=id,gid)]
+```
+
+## 8.4 處理空間自相關係數
+由於加入空間自相關後，預測結果會受到空間自相關影響，因此排除。
+```{r}
+coords <- st_centroid(st_as_sf(np_rf_all)) %>% 
+  st_coordinates() %>% as.data.table() 
+meig <- meigen_f(coords, enum = 85)  # enum = 要幾條
+mem  <- meig$sf %>% as.data.table() # 16 000 × 82
+setnames(mem, paste0("MEM_", sprintf("%03d", seq_len(ncol(mem)))))
+np_rf_sp <- cbind(np_rf_all,mem)
+rm(coords,meig,mem)
+```
+
+## 8.5 建立虛擬天氣與植群係數
+```{r}
+v_name <- colnames(x_1)[c(1:8,17:ncol(x_1))]
+
+vdt <- x_1[,.(var=v_name,mean=lapply(.SD,median)),.SDcols = v_name]
+vdt_t <- dcast(vdt,.~var,value.var = "mean")
+vdt_t[,`.`:=NULL]
+np_rf_sp2 <- cbind(np_rf_all,vdt_t)
+
+```
+
+## 8.6 輸出靜態風險圖
+```{r}
+colnames(np_rf_sp2)
+setnames(np_rf_sp2, 
+         c("f_road", "m_road", "camp", "track"),
+         c("f_rr","m_rr","camp_r","tra_r"))
+pre_x_var <- colnames(x_1)
+np_pre_x <- np_rf_sp2[,..pre_x_var]
+{
+np_predict <- predict(rf_r1,np_pre_x)
+
+np_pr <- cbind(np_rf_sp2[,.(Name,gid,ng_id,geometry)],np_predict$predictions)
+np_pr_l <- lapply(1:3,function(i){
+  
+  dt <- np_pr[gid==i,] %>% .[,fire_risk:=(V2-mean(V2))/sd(V2)] |> st_as_sf()
+})
+np_name <- c("Yashan","Taruku","Shenba")
+lapply(1:3,function(i){
+  st_write(np_pr_l[[i]],paste0(p_path,"result/fire_risk_predict.gpkg"),
+           layer=np_name[[i]],append=FALSE)
+})
+rm(np_predict)
+beepr::beep(2)
+}
+```
+
+# 9. 動態天氣風險
+將過去天氣情況加入model中，評估過往的動態風險。
+## 9.1 利用網格資料簡化ERA5資料擷取點
+使用資料np_grid
+```{r}
+np_gp_2 <- rbindlist(np_gp) %>% st_as_sf()
+ts_layer <- raster(paste0(p_path,"rawdata/layer/ERA5/ERA5_19500101.tif"))
+np_ts_dt <- raster::extract(ts_layer,np_gp_2) %>% as.data.table() 
+np_ts_dt <- data.table(np_gp_2[,c("ng_id")],np_ts_dt)
+colnames(np_ts_dt)[3] <- "var"
+np_ts_dt[,grp:=.GRP,by=var]
+np_bs_dt <- np_ts_dt[!duplicated(grp)]
+np_bs_dt <- np_bs_dt[!is.na(var)]
+write.csv(np_bs_dt,paste0(p_path,"/result/np_spei_point.csv"))
+rm(ts_layer,np_gp_2)
+### 處理雲端下來的資test### 處理雲端下來的資料
+spei <- fread(paste0(p_path,"rawdata/NP_region_monthly_1950_2025_12_31.csv"))
+spei_t <- melt(spei, id.vars=c("grp"),variable.name = "var",value.name="value")
+spei_t[,year:=str_sub(var, start = 1, end = 4)][
+  ,month:=str_sub(var,5,6)][
+    ,var_name:=str_sub(var,8,str_count(var))
+  ]
+spei <- dcast(spei_t,year+month+grp~var_name,value.var = "value")
+
+setnames(spei,c("potential_evaporation_sum",
+              "total_precipitation_sum","temperature_2m"),
+         c("PE","precip","temp"))
+
+spei[,c("PE","precip"):=.(PE*1000,precip*1000)][
+  ,D:=precip+PE][,temp:=temp-273.15]
+for (i in unique(spei$grp)){
+  spei[grp==i,spei_3:=as.data.table(spei(D,3)$fitted)][
+        grp==i,spei_6:=as.data.table(spei(D,6)$fitted)][
+         grp==i,spei_12:=as.data.table(spei(D,12)$fitted)][
+           grp==i,spei_24:=as.data.table(spei(D,24)$fitted)][
+             grp==i,temp_ind:=(temp-mean(temp))/sd(temp)
+           ]
+}
+write.csv(spei,paste0(p_path,"result/SPEI_region.csv"))
+### 合併資料
+rm(spei_t)
+```
+## 9.2 產出逐月的預測表格
+準備其他參數的表格，並做出逐月的資料
+```{r}
+## 準備氣候參數對照表(ng_id vs grp)
+clim_ref_id <- np_ts_dt[,.(ng_id,grp)]
+## 其他參數表格(其他參數固定，去除氣象參數)
+np_pre_bs <- np_rf_sp2[,1:102]
+np_pre_bs <- np_pre_bs[clim_ref_id,on=.(ng_id)]
+np_pre_bs[,Name:=NULL][,geometry:=NULL][,D:=NULL]
+
+## 製造日期
+spei[,c("year","month"):=lapply(.SD,as.numeric),.SDcols = c("year","month")]
+date_seq <- seq(as.Date("1960/1/1"), as.Date("2024/1/1"), "months")
+## 開始預測值
+time_take <- system.time({
+np_time_pre <- lapply(date_seq,function(date_v){
+  clim <- spei[year==year(date_v)&month==month(date_v)]
+  x_dt <- np_pre_bs[clim,on=.(grp)]
+  x_id <- x_dt[,.(gid,ng_id)]
+  pre <- predict(rf_r1,x_dt[,3:ncol(x_dt)])$predict
+  dt <- data.table(date=date_v,x_id,pred=pre)
+  dt[is.na(pred)]
+  dt_avg <- dt[,.(rbr_m=mean(pred),
+                  rbr_f=quantile(pred, 0.25),
+                  rbr_med=quantile(pred, 0.5),
+                  rbr_th=quantile(pred, 0.75)),
+               by=.(date,gid)]
+  return(dt_avg)
+  })
+})
+time_take
+np_time_pre <- rbindlist(np_time_pre)
+np_time_pre[,rbr_std:=NULL]
+np_time_pre[,gid:=factor(gid,levels =c(1,2,3),labels = c("Yushan", "Taroko", "Shei-Pa"))]
+np_time_pre[,rbr_std:=(rbr_m-mean(rbr_m))/sd(rbr_m),by=.(gid)]
+## 加入嚴重火燒的點
+fire_time <- fread(paste0(p_path,"rawdata/all_fire_basedata_final_version.csv"))
+fire_time[,date:=as.Date(paste(substr(firecode,1,4),
+                                substr(firecode,5,6),
+                                  substr(firecode,7,8),
+                              sep = "-"))
+  ]
+fire_time[,gid:=factor(gid,levels =c(1,2,3),labels = c("Yushan", "Taroko", "Shei-Pa"))]
+ggplot()+
+  geom_col(data=np_time_pre,aes(x=date,y=rbr_std,fill=as.factor(gid)),
+            linewidth=0.6)+
+  scale_fill_manual(labels = c("Yushan", "Taroko", "Shei-Pa"),
+                     values = c("#A8C686","#C46A49","#6BA4A9"))+
+  geom_point(data=fire_time[fire_level>2],
+             aes(x=date,y=5,color="Major fire\n(>10 ha)"),
+             size=2,alpha=0.6,shape=21,fill="#F8DA53")+
+  theme_bw()+
+  scale_x_date(date_breaks = "5 years",labels = date_format("%Y"),
+               limits = c(as.Date("1959-12-31"),as.Date("2025-12-31")),
+               minor_breaks = "1 years")+
+  facet_grid(gid~.)+
+  labs(x="Year",y="Fire risk",fill="National park",color="")
+
+ggsave(paste0(p_path,"result/plot/fire_risk_by_time_maxdnbr.jpeg"),
+       width = 12,height=6,dpi=600)
+
+
+```
 
